@@ -1,11 +1,18 @@
 """
-Calculation engine for the Swiss health insurance deductible tool - risk-aversion part.
+Calculation engine for the Swiss health insurance deductible tool.
 
-- Cost function C(F, M) (common base of the model)
+Part 1 - expected cost:
+- Cost function C(F, M)
+- Expected cost E[C(F, M)] and its bounds from the cost brackets
+- Linear-premium benchmark P(F) = P(300) - 0.7 (F - 300) and check on real premiums
+- Slope of the expected cost (concavity check) and bounds on the difference between two deductibles
+
+Part 2 - risk aversion:
 - CARA certainty equivalent CE_a(F) (for a = 0 it equals the expected cost)
 - Coin-flip calibration of the risk-aversion coefficient a (bisection)
 - Critical coefficients a* where the recommended deductible changes
 
+The expected-cost part (bounds per cost bracket) will be added from Adrian's formulas.
 All amounts are in CHF per year. Probabilities p are the 9 bracket shares from data.py.
 """
 
@@ -17,6 +24,8 @@ COPAY_RATE = 0.10                          # co-payment above the deductible
 COPAY_CAP = 700                            # maximum co-payment per year (adults)
 COPAY_CAP_EXPENSE = COPAY_CAP / COPAY_RATE  # = 7'000: expenses above F + 7'000 add nothing
 COIN_FLIP_LOSS = 2000                      # the gamble: pay 0 or 2'000 with prob. 1/2
+MAX_DISCOUNT_RATE = 0.70                   # legal maximum: premium discount <= 70% of the extra risk
+F_MIN = 300                                # lowest adult deductible
 
 LOWER = np.array([lo for lo, hi in BRACKETS], dtype=float)
 UPPER = np.array([hi for lo, hi in BRACKETS], dtype=float)          # last one = inf
@@ -42,6 +51,82 @@ def cost(F, M, premium):
 
 
 # ---------------------------------------------------------------------------
+# Part 1: expected cost 
+# ---------------------------------------------------------------------------
+def expected_cost(F, premium, p, values="mid"):
+    """E[C(F, M)] = sum_i p_i C(F, M_i), with M_i the lower bound, midpoint or upper bound
+    of each cost bracket."""
+    return float(np.sum(p * cost(F, VALUES[values], premium)))
+
+
+def expected_cost_bounds(F, premium, p):
+    """Lower and upper bound of E[C(F, M)]. C is increasing in M, so taking the lowest
+    (highest) expense of every bracket gives a lower (upper) bound."""
+    return expected_cost(F, premium, p, "lower"), expected_cost(F, premium, p, "upper")
+
+
+def linear_premium(F, premium_300):
+    """Theoretical benchmark: insurers give the maximum legal discount at every level,
+    P(F) = P(300) - 0.7 (F - 300)."""
+    return premium_300 - MAX_DISCOUNT_RATE * (F - F_MIN)
+
+
+def premium_discount_check(premiums):
+    """Compare the real premiums with the legal maximum discount.
+    Returns, for each F, the actual discount P(300) - P(F), the maximum 0.7 (F - 300)
+    and the share of the maximum that is granted (1.0 = linear benchmark holds)."""
+    p300 = premiums[F_MIN]
+    out = {}
+    for F in sorted(premiums):
+        if F == F_MIN:
+            continue
+        actual = p300 - premiums[F]
+        maximum = MAX_DISCOUNT_RATE * (F - F_MIN)
+        out[F] = {"discount": actual, "max_discount": maximum, "share_of_max": actual / maximum}
+    return out
+
+
+def survival(m, p, values="mid"):
+    """S(m) = Pr(M > m), using one representative value per bracket."""
+    return float(np.sum(p[VALUES[values] > m]))
+
+
+def expected_cost_slope(F, p, values="mid"):
+    """Slope of the expected cost under the linear-premium benchmark:
+    dE[C]/dF = -0.7 + 0.9 S(F) + 0.1 S(F + 7000)."""
+    return -MAX_DISCOUNT_RATE + (1 - COPAY_RATE) * survival(F, p, values) \
+        + COPAY_RATE * survival(F + COPAY_CAP_EXPENSE, p, values)
+
+
+def is_concave(premiums, p, values="mid", tol=1e-9):
+    """Discrete concavity check of F -> E[C(F, M)] on the available deductibles:
+    the slopes between consecutive deductibles must never increase."""
+    Fs = sorted(premiums)
+    ec = [expected_cost(F, premiums[F], p, values) for F in Fs]
+    slopes = [(ec[k + 1] - ec[k]) / (Fs[k + 1] - Fs[k]) for k in range(len(Fs) - 1)]
+    return all(slopes[k + 1] <= slopes[k] + tol for k in range(len(slopes) - 1)), slopes
+
+
+def difference_bounds(F1, F2, premiums, p):
+    """Bounds on E[C(F1, M)] - E[C(F2, M)] that use only the bracket shares.
+    d(M) = C(F1, M) - C(F2, M) is piecewise linear in M, so inside each bracket its minimum
+    and maximum are reached at the bracket ends or at the kinks F1, F2, F1 + 7000, F2 + 7000.
+    If the upper bound is < 0, F1 is cheaper on average whatever the costs inside the brackets."""
+    kinks = np.array([F1, F2, F1 + COPAY_CAP_EXPENSE, F2 + COPAY_CAP_EXPENSE])
+    d = lambda M: cost(F1, M, premiums[F1]) - cost(F2, M, premiums[F2])
+    low = high = 0.0
+    for pi, lo, hi in zip(p, LOWER, UPPER):
+        if pi == 0:
+            continue
+        top = hi if np.isfinite(hi) else max(lo, kinks.max()) + 1.0   # d is constant after the last kink
+        points = np.concatenate(([lo, top], kinks[(kinks > lo) & (kinks < top)]))
+        values = d(points)
+        low += pi * values.min()
+        high += pi * values.max()
+    return float(low), float(high)
+
+
+# ---------------------------------------------------------------------------
 # Part 2: risk aversion (CARA utility u(x) = -exp(-a x))
 # ---------------------------------------------------------------------------
 def certainty_equivalent(F, premium, p, a, values="mid"):
@@ -58,12 +143,12 @@ def certainty_equivalent(F, premium, p, a, values="mid"):
 
 
 def risk_premium(F, premium, p, a, values="mid"):
-    """Risk premium pi_a(F) = CE_a(F) - E[C(F, M)] >= 0."""
+    """Risk premium pi_a(F) = CE_a(F) - E[C(F, M)] >= 0 ."""
     return certainty_equivalent(F, premium, p, a, values) - certainty_equivalent(F, premium, p, 0.0, values)
 
 
 def certainty_equivalent_taylor(F, premium, p, a, values="mid"):
-    """Second-order (Arrow-Pratt) approximation: CE ~ E[C] + (a/2) Var(C).
+    """Second-order (Arrow-Pratt) approximation: CE ~ E[C] + (a/2) Var(C) (section 2.4).
     Used only to compare with the exact certainty equivalent."""
     c = cost(F, VALUES[values], premium)
     mean = float(np.sum(p * c))
@@ -135,7 +220,7 @@ def critical_thresholds(premiums, p, a_max=0.01, n_grid=4001, values="mid", tol=
 
 
 def robustness(w, thresholds):
-    """Where the user's coin-flip answer w falls relative to the thresholds w* .
+    """Where the user's coin-flip answer w falls relative to the thresholds w*.
     Returns the nearest threshold and the distance to it in CHF (a large distance means a
     robust recommendation, a small one means that both deductibles are defensible)."""
     if not thresholds:
@@ -145,7 +230,7 @@ def robustness(w, thresholds):
 
 
 # ---------------------------------------------------------------------------
-# Quick check with the real data 
+# Quick check with the real data
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import pandas as pd
@@ -159,6 +244,21 @@ if __name__ == "__main__":
     p, _ = expense_distribution(exp, "26-30", "hommes", False, pcg=False)
 
     print("Premiums (median insurer):", {F: round(v) for F, v in premiums.items()})
+
+    print("\n--- Part 1: expected cost ---")
+    check = premium_discount_check(premiums)
+    print("Share of the maximum legal discount granted:",
+          {F: round(v["share_of_max"], 3) for F, v in check.items()})
+    for F in DEDUCTIBLES_ADULT:
+        lo, hi = expected_cost_bounds(F, premiums[F], p)
+        print(f"F = {F}: E[C] = {expected_cost(F, premiums[F], p):.0f}  (bounds {lo:.0f} - {hi:.0f}),"
+              f" slope {expected_cost_slope(F, p):+.3f}")
+    concave, slopes = is_concave(premiums, p)
+    print("Concave on the six deductibles:", concave, "| slopes:", [round(s, 3) for s in slopes])
+    lo, hi = difference_bounds(2500, 300, premiums, p)
+    print(f"E[C(2500)] - E[C(300)] is between {lo:.0f} and {hi:.0f} CHF")
+
+    print("\n--- Part 2: risk aversion ---")
     a = a_from_answer(1400)
     print(f"a for an answer of 1400: {a:.6f}  (check w(a) = {coin_flip_answer(a):.1f})")
     print("F | expected cost (a = 0) | certainty equivalent (a for 1400)")
